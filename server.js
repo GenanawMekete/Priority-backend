@@ -1,60 +1,46 @@
-import { startTelegramBot } from "./bot/telegramBot.js";
 import express from "express";
-import mongoose from "mongoose";
-import cors from "cors";
 import http from "http";
 import { Server } from "socket.io";
+import cors from "cors";
 import dotenv from "dotenv";
+import connectDB from "./config/db.js";
 
-// routes & sockets
 import depositRoutes from "./routes/deposit.js";
-import gameSocket from "./sockets/gameSocket.js";
-import authRoutes from "./routes/auth.js";
+import { initGameSocket } from "./sockets/gameSocket.js";
 
-// load env
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 4000;
-const MONGO_URI = process.env.MONGO_URI;
-app.use("/api/auth", authRoutes);
-// middleware
+const server = http.createServer(app);
+
+/* ---------- Socket.IO ---------- */
+const io = new Server(server, {
+  cors: {
+    origin: "*", // later restrict to Netlify domain
+    methods: ["GET", "POST"],
+  },
+});
+
+/* ---------- Middleware ---------- */
 app.use(cors());
 app.use(express.json());
 
-// health check
+/* ---------- Routes ---------- */
 app.get("/", (req, res) => {
-  res.send("🚀 Bingo Backend Running Successfully");
+  res.send("🎉 Bingo Backend Running Successfully");
 });
 
-// routes
 app.use("/api/deposit", depositRoutes);
 
-// create http server
-const server = http.createServer(app);
+/* ---------- DB ---------- */
+connectDB();
 
-// socket.io
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
-});
+/* ---------- Socket Logic ---------- */
+initGameSocket(io);
 
-// init sockets
-gameSocket(io);
+/* ---------- Port Binding (VERY IMPORTANT FOR RENDER) ---------- */
+const PORT = process.env.PORT || 5000;
 
-// connect mongodb
-mongoose.connect(MONGO_URI)
-  .then(() => {
-    console.log("✅ MongoDB connected successfully");
-  })
-  .catch((err) => {
-    console.error("❌ MongoDB connection error:", err);
-  });
-
-// start server
 server.listen(PORT, () => {
-  console.log(`🚀 Bingo backend running on port ${PORT}`);
-  startTelegramBot();
+  console.log(`🚀 Server running on port ${PORT}`);
 });
