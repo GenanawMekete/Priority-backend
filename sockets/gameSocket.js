@@ -1,151 +1,170 @@
-import { Server } from "socket.io";
-import { generateCard } from "../engine/cardGenerator.js";
-import { checkWinner } from "../engine/patternChecker.js";
-import { startDrawEngine, stopDrawEngine } from "../engine/drawEngine.js";
+// backend/sockets/gameSocket.js
 
-// In-memory storage for rooms (replace with DB for production)
-const rooms = {}; // roomId => { players: [], cardsTaken: {}, calledNumbers: [], drawInterval, winners: [] }
+import Game from "../models/Game.js";
+import Card from "../models/Card.js";
+import { startDrawEngine } from "../engine/drawEngine.js";
 
-export default (server) => {
-  const io = new Server(server, {
-    cors: {
-      origin: "*", // adjust for production
-      methods: ["GET", "POST"],
-    },
-  });
+/* In-memory state (fast, resets if server restarts) */
+let rooms = {}; 
+// rooms[roomId] = {
+//   players: { telegramId: socketId },
+//   takenCards: Set(),
+//   selectedCards: { telegramId: [cardNumbers] },
+//   started: false,
+// };
 
+export function initGameSocket(io) {
   io.on("connection", (socket) => {
-    console.log("New socket connected:", socket.id);
+    console.log("🟢 Player connected:", socket.id);
 
-    // =======================
-    // Join Lobby / Room
-    // =======================
-    socket.on("join-lobby", ({ telegramId, roomId }) => {
+    /* -------- JOIN ROOM -------- */
+    socket.on("join-room", async ({ roomId, telegramId }) => {
+      socket.join(roomId);
+
       if (!rooms[roomId]) {
         rooms[roomId] = {
-          players: [],
-          cardsTaken: {},
-          calledNumbers: [],
-          winners: [],
-          drawInterval: null,
+          players: {},
+          takenCards: new Set(),
+          selectedCards: {},
+          started: false,
         };
-      }
 
-      // Add player if not exists
-      const player = rooms[roomId].players.find((p) => p.telegramId === telegramId);
-      if (!player) {
-        rooms[roomId].players.push({
-          telegramId,
-          cards: [], // numbers 1-400 assigned
-          hasBingo: false,
+        // Create game in DB if not exists
+        await Game.create({
+          roomId,
+          status: "waiting",
+          calledNumbers: [],
+          players: [],
         });
+
+        console.log("🏠 New room created:", roomId);
       }
 
-      // Send current taken cards for lobby UI
-      const cardsArray = Object.entries(rooms[roomId].cardsTaken).map(([number, content]) => ({
-        number: parseInt(number),
-        content,
-      }));
-      socket.emit("current-taken-cards", { cards: cardsArray });
+      rooms[roomId].players[telegramId] = socket.id;
+
+      socket.emit("room-joined", { roomId });
+      console.log(`👤 ${telegramId} joined room ${roomId}`);
     });
 
-    // =======================
-    // Player Selects Card
-    // =======================
-    socket.on("select-card", ({ telegramId, roomId, number }) => {
+    /* -------- CARD SELECTION (1–400) -------- */
+    socket.on("select-card", async ({ roomId, telegramId, number }) => {
       const room = rooms[roomId];
-      if (!room) return;
+      if (!room || room.started) return;
 
-      // Already taken
-      if (room.cardsTaken[number]) return;
-
-      // Generate unique card content
-      const cardContent = generateCard();
-
-      // Mark card as taken
-      room.cardsTaken[number] = cardContent;
-
-      // Assign to player
-      const player = room.players.find((p) => p.telegramId === telegramId);
-      if (player) player.cards.push({ number, content: cardContent });
-
-      // Broadcast to all clients in room
-      io.emit("card-assigned", { number, content: cardContent });
-    });
-
-    // =======================
-    // Start Game Draw
-    // =======================
-    socket.on("start-game", ({ roomId }) => {
-      const room = rooms[roomId];
-      if (!room) return;
-
-      room.calledNumbers = [];
-      room.winners = [];
-      room.players.forEach((p) => (p.hasBingo = false));
-
-      // Start draw engine every 3 seconds
-      room.drawInterval = setInterval(() => {
-        const nextNumber = startDrawEngine(room.calledNumbers);
-        if (!nextNumber) return; // all numbers drawn
-
-        room.calledNumbers.push(nextNumber);
-        io.emit("number-called", { number: nextNumber, roomId });
-      }, 3000);
-    });
-
-    // =======================
-    // Player presses BINGO
-    // =======================
-    socket.on("press-bingo", ({ telegramId, roomId }) => {
-      const room = rooms[roomId];
-      if (!room || room.winners.includes(telegramId)) return;
-
-      const player = room.players.find((p) => p.telegramId === telegramId);
-      if (!player) return;
-
-      let valid = false;
-      // Check each assigned card
-      for (const c of player.cards) {
-        if (checkWinner(c.content, room.calledNumbers)) {
-          valid = true;
-          break;
-        }
-      }
-
-      if (!valid) {
-        socket.emit("false-bingo", { telegramId });
+      // Already taken?
+      if (room.takenCards.has(number)) {
+        socket.emit("card-rejected", number);
         return;
       }
 
-      // First valid Bingo → stop draw
-      if (room.winners.length === 0) {
-        clearInterval(room.drawInterval);
-        room.drawInterval = null;
+      // Max 3 cards per player
+      const current = room.selectedCards[telegramId] || [];
+      if (current.length >= 3) return;
+
+      // Generate card content if not exists
+      let card = await Card.findOne({ number });
+
+      if (!card) {
+        card = await Card.create({
+          number,
+          grid: generateBingoCard(),
+        });
       }
 
-      player.hasBingo = true;
-      room.winners.push(telegramId);
+      // Save selection
+      room.takenCards.add(number);
+      room.selectedCards[telegramId] = [...current, number];
 
-      // Announce winners
-      const totalPool = room.players.length * 10; // assuming fixed bet
-      const derash = totalPool * 0.8;
-      const prizePerWinner = derash / room.winners.length;
+      // Save to DB
+      await Game.updateOne(
+        { roomId },
+        {
+          $addToSet: { players: telegramId },
+          $push: { cards: { telegramId, number, grid: card.grid } },
+        }
+      );
 
-      io.emit("game-won", {
-        roomId,
-        winners: room.winners,
-        derash,
-        prize: prizePerWinner,
+      // Broadcast to everyone
+      io.to(roomId).emit("card-assigned", {
+        number,
+        telegramId,
+        content: card.grid,
       });
+
+      console.log(`🎴 Card ${number} taken by ${telegramId}`);
     });
 
-    // =======================
-    // Disconnect
-    // =======================
+    /* -------- AUTO START GAME (WHEN TIMER ENDS OR FIRST PLAYER READY) -------- */
+    socket.on("start-game", async ({ roomId }) => {
+      const room = rooms[roomId];
+      if (!room || room.started) return;
+
+      room.started = true;
+
+      await Game.updateOne(
+        { roomId },
+        { status: "running" }
+      );
+
+      io.to(roomId).emit("game-started");
+
+      console.log("🚀 Game started in room:", roomId);
+
+      // Start automatic draw engine
+      startDrawEngine(io, roomId);
+    });
+
+    /* -------- CLAIM BINGO -------- */
+    socket.on("claim-bingo", async ({ roomId, telegramId, cardNumber }) => {
+      console.log(`🏆 Bingo claim from ${telegramId} on card ${cardNumber}`);
+
+      // Here later we validate patterns
+      // For now: accept winner
+
+      io.to(roomId).emit("winner", {
+        telegramId,
+        cardNumber,
+      });
+
+      await Game.updateOne(
+        { roomId },
+        { status: "finished", winner: telegramId }
+      );
+
+      console.log("🎉 Winner:", telegramId);
+    });
+
+    /* -------- DISCONNECT -------- */
     socket.on("disconnect", () => {
-      console.log("Socket disconnected:", socket.id);
-      // Optional: remove player from rooms if needed
+      console.log("🔴 Player disconnected:", socket.id);
     });
   });
-};
+}
+
+/* -------- BINGO CARD GENERATOR (5x5) -------- */
+function generateBingoCard() {
+  function randomNumbers(min, max, count) {
+    const arr = [];
+    while (arr.length < count) {
+      const n = Math.floor(Math.random() * (max - min + 1)) + min;
+      if (!arr.includes(n)) arr.push(n);
+    }
+    return arr;
+  }
+
+  const B = randomNumbers(1, 15, 5);
+  const I = randomNumbers(16, 30, 5);
+  const N = randomNumbers(31, 45, 5);
+  const G = randomNumbers(46, 60, 5);
+  const O = randomNumbers(61, 75, 5);
+
+  const grid = [];
+
+  for (let i = 0; i < 5; i++) {
+    grid.push([B[i], I[i], N[i], G[i], O[i]]);
+  }
+
+  grid[2][2] = "FREE"; // center
+
+  return grid;
+}
