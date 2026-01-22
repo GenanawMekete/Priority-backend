@@ -1,92 +1,56 @@
 import Game from "../models/Game.js";
-import Card from "../models/Card.js";
-import { startDrawEngine } from "../engine/drawEngine.js";
-import { checkWinner } from "../engine/patternChecker.js";
+import { startDrawEngine, stopDrawEngine } from "../engine/drawEngine.js";
 
-let currentGame = null;
-
-export const initGameSocket = (io) => {
-
+export default function gameSocket(io) {
   io.on("connection", (socket) => {
     console.log("🟢 Player connected:", socket.id);
 
-    // Player joins lobby
-    socket.on("join-game", async ({ telegramId }) => {
+    // Join game
+    socket.on("joinGame", async (telegramId) => {
+      let game = await Game.findOne({ status: "WAITING" });
 
-      if (!currentGame || currentGame.status !== "WAITING") {
-        socket.emit("error", "Game already started");
-        return;
+      if (!game) {
+        game = await Game.create({});
       }
 
-      const cards = await Card.aggregate([{ $sample: { size: 3 } }]);
+      const exists = game.players.find(p => p.telegramId === telegramId);
 
-      currentGame.players.push({
-        telegramId,
-        cards: cards.map(c => c._id),
-        hasBingo: false
-      });
+      if (!exists) {
+        game.players.push({ telegramId, cards: [] });
+        await game.save();
+      }
 
-      await currentGame.save();
+      socket.emit("joined", game._id);
+      console.log("👤 Player joined:", telegramId);
 
-      socket.emit("cards-assigned", cards);
+      // Auto start when first player comes
+      if (game.players.length === 1) {
+        game.status = "RUNNING";
+        await game.save();
+        startDrawEngine(io, game);
+        console.log("🚀 Game started");
+      }
     });
 
-    // Manual bingo press
-    socket.on("press-bingo", async ({ telegramId }) => {
-      if (!currentGame || currentGame.status !== "RUNNING") return;
+    // Player says BINGO
+    socket.on("bingo", async ({ telegramId }) => {
+      const game = await Game.findOne({ status: "RUNNING" });
 
-      const player = currentGame.players.find(p => p.telegramId === telegramId);
-      if (!player || player.hasBingo) return;
+      if (!game) return;
 
-      let valid = false;
+      game.winners.push(telegramId);
+      game.status = "FINISHED";
+      await game.save();
 
-      for (const cardId of player.cards) {
-        const card = await Card.findById(cardId);
-        if (checkWinner(card.numbers, currentGame.calledNumbers)) {
-          valid = true;
-          break;
-        }
-      }
+      stopDrawEngine();
 
-      if (!valid) {
-        socket.emit("false-bingo");
-        return;
-      }
+      io.emit("gameFinished", { winner: telegramId });
 
-      player.hasBingo = true;
-
-      if (currentGame.winners.length === 0) {
-        currentGame.status = "VERIFY";
-      }
-
-      currentGame.winners.push(telegramId);
-      await currentGame.save();
+      console.log("🏆 Winner:", telegramId);
     });
 
     socket.on("disconnect", () => {
       console.log("🔴 Player disconnected:", socket.id);
     });
   });
-
-  // Start first game automatically
-  startNewRound(io);
-};
-
-/* ------------------ GAME ROUND ENGINE ------------------ */
-
-const startNewRound = async (io) => {
-  currentGame = await Game.create({
-    status: "WAITING",
-    players: [],
-    winners: [],
-    calledNumbers: []
-  });
-
-  io.emit("new-round");
-
-  // 30 seconds lobby
-  setTimeout(() => {
-    currentGame.status = "RUNNING";
-    startDrawEngine(io, currentGame);
-  }, 30000);
-};
+}
