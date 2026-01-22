@@ -4,7 +4,10 @@ import http from "http";
 import { Server } from "socket.io";
 import { connectDB } from "./config/db.js";
 import { gameSocket, startNewRound } from "./sockets/gameSocket.js";
+import depositRoutes from "./routes/deposit.js";
 
+app.use(express.json());
+app.use("/api", depositRoutes);
 const app = express();
 app.use(cors());
 
