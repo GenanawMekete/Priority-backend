@@ -1,22 +1,48 @@
-export function checkWinner(card, called) {
-  const c = card.map(row => row.map(n => called.includes(n)));
+// backend/engine/patternChecker.js
+
+export function checkAllPatterns(grid, called) {
+  const marked = grid.map(row =>
+    row.map(n => n === "FREE" || called.includes(n))
+  );
 
   // Rows
-  for (let r = 0; r < 5; r++) if (c[r].every(x => x)) return true;
+  for (let r = 0; r < 5; r++) {
+    if (marked[r].every(v => v)) return true;
+  }
 
   // Columns
-  for (let col = 0; col < 5; col++) {
-    let ok = true;
-    for (let r = 0; r < 5; r++) if (!c[r][col]) ok = false;
-    if (ok) return true;
+  for (let c = 0; c < 5; c++) {
+    let win = true;
+    for (let r = 0; r < 5; r++) {
+      if (!marked[r][c]) win = false;
+    }
+    if (win) return true;
   }
 
   // Diagonals
-  if ([0,1,2,3,4].every(i => c[i][i])) return true;
-  if ([0,1,2,3,4].every(i => c[i][4-i])) return true;
+  if (
+    marked[0][0] &&
+    marked[1][1] &&
+    marked[2][2] &&
+    marked[3][3] &&
+    marked[4][4]
+  ) return true;
+
+  if (
+    marked[0][4] &&
+    marked[1][3] &&
+    marked[2][2] &&
+    marked[3][1] &&
+    marked[4][0]
+  ) return true;
 
   // 4 corners
-  if (c[0][0] && c[0][4] && c[4][0] && c[4][4]) return true;
+  if (
+    marked[0][0] &&
+    marked[0][4] &&
+    marked[4][0] &&
+    marked[4][4]
+  ) return true;
 
   return false;
 }
