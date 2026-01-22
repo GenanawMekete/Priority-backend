@@ -9,6 +9,7 @@ import dotenv from "dotenv";
 // routes & sockets
 import depositRoutes from "./routes/deposit.js";
 import gameSocket from "./sockets/gameSocket.js";
+import authRoutes from "./routes/auth.js";
 
 // load env
 dotenv.config();
@@ -16,7 +17,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 const MONGO_URI = process.env.MONGO_URI;
-
+app.use("/api/auth", authRoutes);
 // middleware
 app.use(cors());
 app.use(express.json());
