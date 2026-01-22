@@ -1,60 +1,50 @@
 // backend/engine/drawEngine.js
+
 import Game from "../models/Game.js";
+import { checkAllPatterns } from "./patternChecker.js";
 
-let drawIntervals = {}; // roomId -> interval
+let activeDraws = {}; // roomId -> interval
 
-/* Generate numbers 1–75 randomly */
-function generateShuffledNumbers() {
-  const nums = Array.from({ length: 75 }, (_, i) => i + 1);
-  for (let i = nums.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [nums[i], nums[j]] = [nums[j], nums[i]];
-  }
-  return nums;
-}
-
-/* Start automatic drawing for a room */
 export function startDrawEngine(io, roomId) {
-  console.log("🎯 Starting draw engine for room:", roomId);
+  if (activeDraws[roomId]) return; // already running
 
-  let numbers = generateShuffledNumbers();
-  let index = 0;
+  let available = Array.from({ length: 75 }, (_, i) => i + 1);
+  let called = [];
 
-  drawIntervals[roomId] = setInterval(async () => {
-    if (index >= numbers.length) {
-      clearInterval(drawIntervals[roomId]);
-      delete drawIntervals[roomId];
+  console.log("🎯 Draw engine started for room:", roomId);
 
-      await Game.updateOne(
-        { roomId },
-        { status: "finished" }
-      );
-
-      io.to(roomId).emit("game-finished");
-      console.log("🏁 Game finished:", roomId);
+  const interval = setInterval(async () => {
+    if (available.length === 0) {
+      clearInterval(interval);
+      delete activeDraws[roomId];
       return;
     }
 
-    const number = numbers[index++];
-    console.log("🔢 Drawn:", number);
+    // Draw random number
+    const index = Math.floor(Math.random() * available.length);
+    const number = available.splice(index, 1)[0];
+    called.push(number);
 
-    // Save to DB
+    // Save in DB
     await Game.updateOne(
       { roomId },
-      { $push: { calledNumbers: number }, status: "running" }
+      { $push: { calledNumbers: number } }
     );
 
-    // Broadcast to players
+    // Broadcast number
     io.to(roomId).emit("number-drawn", number);
+    console.log("🔢 Drawn:", number);
 
-  }, 4000); // draw every 4 seconds
+  }, 3000); // 3 seconds
+
+  activeDraws[roomId] = interval;
 }
 
-/* Stop a game manually if needed (future admin feature) */
+/* Stop engine when game finishes */
 export function stopDrawEngine(roomId) {
-  if (drawIntervals[roomId]) {
-    clearInterval(drawIntervals[roomId]);
-    delete drawIntervals[roomId];
-    console.log("🛑 Draw stopped for room:", roomId);
+  if (activeDraws[roomId]) {
+    clearInterval(activeDraws[roomId]);
+    delete activeDraws[roomId];
+    console.log("⛔ Draw engine stopped for room:", roomId);
   }
 }
