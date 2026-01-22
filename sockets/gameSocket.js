@@ -1,193 +1,151 @@
 import { Server } from "socket.io";
-import { Card } from "../models/Card.js";
-import { Game } from "../models/Game.js";
-
-// Helper to check if card numbers match winning pattern
+import { generateCard } from "../engine/cardGenerator.js";
 import { checkWinner } from "../engine/patternChecker.js";
 import { startDrawEngine, stopDrawEngine } from "../engine/drawEngine.js";
 
-// Keep all active rooms here (for future multi-room support)
-const activeGames = {}; // roomId → game object
+// In-memory storage for rooms (replace with DB for production)
+const rooms = {}; // roomId => { players: [], cardsTaken: {}, calledNumbers: [], drawInterval, winners: [] }
 
-export const initializeGameSocket = (server) => {
+export default (server) => {
   const io = new Server(server, {
-    cors: { origin: "*" },
+    cors: {
+      origin: "*", // adjust for production
+      methods: ["GET", "POST"],
+    },
   });
 
   io.on("connection", (socket) => {
-    console.log("Player connected", socket.id);
+    console.log("New socket connected:", socket.id);
 
-    // ===========================
-    // JOIN GAME / ROOM
-    // ===========================
-    socket.on("join-game", async ({ telegramId, roomId = "default" }) => {
-      if (!activeGames[roomId]) {
-        // Initialize room if it doesn't exist
-        activeGames[roomId] = {
-          roomId,
+    // =======================
+    // Join Lobby / Room
+    // =======================
+    socket.on("join-lobby", ({ telegramId, roomId }) => {
+      if (!rooms[roomId]) {
+        rooms[roomId] = {
           players: [],
+          cardsTaken: {},
           calledNumbers: [],
-          status: "WAITING",
           winners: [],
           drawInterval: null,
         };
       }
 
-      const game = activeGames[roomId];
-
-      // Avoid duplicate joins
-      if (!game.players.find((p) => p.telegramId === telegramId)) {
-        game.players.push({
+      // Add player if not exists
+      const player = rooms[roomId].players.find((p) => p.telegramId === telegramId);
+      if (!player) {
+        rooms[roomId].players.push({
           telegramId,
-          cards: [], // card numbers assigned
+          cards: [], // numbers 1-400 assigned
           hasBingo: false,
         });
       }
 
-      socket.join(roomId);
-      io.to(roomId).emit("players-updated", game.players.map((p) => p.telegramId));
+      // Send current taken cards for lobby UI
+      const cardsArray = Object.entries(rooms[roomId].cardsTaken).map(([number, content]) => ({
+        number: parseInt(number),
+        content,
+      }));
+      socket.emit("current-taken-cards", { cards: cardsArray });
     });
 
-    // ===========================
-    // SELECT CARD
-    // ===========================
-    socket.on("select-card", async ({ telegramId, number, roomId = "default" }) => {
-      const game = activeGames[roomId];
-      if (!game) return;
+    // =======================
+    // Player Selects Card
+    // =======================
+    socket.on("select-card", ({ telegramId, roomId, number }) => {
+      const room = rooms[roomId];
+      if (!room) return;
 
-      // Check if card is already taken
-      if (game.players.some((p) => p.cards.includes(number))) {
-        socket.emit("card-taken", number);
-        return;
-      }
+      // Already taken
+      if (room.cardsTaken[number]) return;
 
-      // Assign random bingo numbers to this card
-      const cardDoc = await Card.aggregate([{ $sample: { size: 1 } }]);
-      const cardContent = cardDoc[0].numbers;
+      // Generate unique card content
+      const cardContent = generateCard();
 
-      // Update game state
-      game.players.forEach((p) => {
-        if (p.telegramId === telegramId) {
-          p.cards.push(number);
-        }
-      });
+      // Mark card as taken
+      room.cardsTaken[number] = cardContent;
 
-      // Broadcast to everyone that this card number is now taken
-      io.to(roomId).emit("card-assigned", { number, content: cardContent });
+      // Assign to player
+      const player = room.players.find((p) => p.telegramId === telegramId);
+      if (player) player.cards.push({ number, content: cardContent });
+
+      // Broadcast to all clients in room
+      io.emit("card-assigned", { number, content: cardContent });
     });
 
-    // ===========================
-    // UNSELECT CARD
-    // ===========================
-    socket.on("unselect-card", ({ telegramId, number, roomId = "default" }) => {
-      const game = activeGames[roomId];
-      if (!game) return;
+    // =======================
+    // Start Game Draw
+    // =======================
+    socket.on("start-game", ({ roomId }) => {
+      const room = rooms[roomId];
+      if (!room) return;
 
-      game.players.forEach((p) => {
-        if (p.telegramId === telegramId) {
-          p.cards = p.cards.filter((c) => c !== number);
-        }
-      });
+      room.calledNumbers = [];
+      room.winners = [];
+      room.players.forEach((p) => (p.hasBingo = false));
 
-      io.to(roomId).emit("card-unassigned", { number });
+      // Start draw engine every 3 seconds
+      room.drawInterval = setInterval(() => {
+        const nextNumber = startDrawEngine(room.calledNumbers);
+        if (!nextNumber) return; // all numbers drawn
+
+        room.calledNumbers.push(nextNumber);
+        io.emit("number-called", { number: nextNumber, roomId });
+      }, 3000);
     });
 
-    // ===========================
-    // PRESS BINGO
-    // ===========================
-    socket.on("press-bingo", async ({ telegramId, roomId = "default" }) => {
-      const game = activeGames[roomId];
-      if (!game || game.status !== "RUNNING") return;
+    // =======================
+    // Player presses BINGO
+    // =======================
+    socket.on("press-bingo", ({ telegramId, roomId }) => {
+      const room = rooms[roomId];
+      if (!room || room.winners.includes(telegramId)) return;
 
-      const player = game.players.find((p) => p.telegramId === telegramId);
-      if (!player || player.hasBingo) return;
+      const player = room.players.find((p) => p.telegramId === telegramId);
+      if (!player) return;
 
       let valid = false;
-
-      for (const cardNumber of player.cards) {
-        const card = await Card.findOne({ number: cardNumber });
-        if (card && checkWinner(card.numbers, game.calledNumbers)) {
+      // Check each assigned card
+      for (const c of player.cards) {
+        if (checkWinner(c.content, room.calledNumbers)) {
           valid = true;
           break;
         }
       }
 
       if (!valid) {
-        socket.emit("false-bingo");
+        socket.emit("false-bingo", { telegramId });
         return;
       }
 
-      // Mark player as winner
-      player.hasBingo = true;
-      game.winners.push(telegramId);
-
-      // Stop draw engine if first valid bingo
-      if (game.winners.length === 1) {
-        stopDrawEngine(game.drawInterval);
-        game.status = "VERIFY";
-
-        // Verify all other players
-        setTimeout(async () => {
-          const finalWinners = [];
-
-          for (const p of game.players) {
-            for (const cardNumber of p.cards) {
-              const card = await Card.findOne({ number: cardNumber });
-              if (card && checkWinner(card.numbers, game.calledNumbers)) {
-                finalWinners.push(p.telegramId);
-                break;
-              }
-            }
-          }
-
-          const totalPool = game.players.length * 10;
-          const derash = totalPool * 0.8;
-          const prize = derash / finalWinners.length;
-
-          game.status = "FINISHED";
-          io.to(roomId).emit("game-won", {
-            winners: finalWinners,
-            derash,
-            prize,
-          });
-
-          // Reset after 5 seconds
-          setTimeout(() => {
-            activeGames[roomId] = {
-              roomId,
-              players: [],
-              calledNumbers: [],
-              status: "WAITING",
-              winners: [],
-              drawInterval: null,
-            };
-            io.to(roomId).emit("new-round");
-          }, 5000);
-        }, 1000);
+      // First valid Bingo → stop draw
+      if (room.winners.length === 0) {
+        clearInterval(room.drawInterval);
+        room.drawInterval = null;
       }
-    });
 
-    // ===========================
-    // START DRAW (ADMIN / SERVER)
-    // ===========================
-    socket.on("start-draw", ({ roomId = "default" }) => {
-      const game = activeGames[roomId];
-      if (!game || game.status !== "WAITING") return;
+      player.hasBingo = true;
+      room.winners.push(telegramId);
 
-      game.status = "RUNNING";
+      // Announce winners
+      const totalPool = room.players.length * 10; // assuming fixed bet
+      const derash = totalPool * 0.8;
+      const prizePerWinner = derash / room.winners.length;
 
-      game.drawInterval = startDrawEngine(io, roomId, game.calledNumbers);
-    });
-
-    // ===========================
-    // DISCONNECT
-    // ===========================
-    socket.on("disconnect", () => {
-      console.log("Player disconnected", socket.id);
-      // Optional: remove player from all rooms
-      Object.values(activeGames).forEach((game) => {
-        game.players = game.players.filter((p) => p.socketId !== socket.id);
+      io.emit("game-won", {
+        roomId,
+        winners: room.winners,
+        derash,
+        prize: prizePerWinner,
       });
+    });
+
+    // =======================
+    // Disconnect
+    // =======================
+    socket.on("disconnect", () => {
+      console.log("Socket disconnected:", socket.id);
+      // Optional: remove player from rooms if needed
     });
   });
 };
