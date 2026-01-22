@@ -1,43 +1,37 @@
 import express from "express";
-import http from "http";
+import mongoose from "mongoose";
 import cors from "cors";
-import dotenv from "dotenv";
+import http from "http";
 import { Server } from "socket.io";
-import connectDB from "./config/db.js";
+import dotenv from "dotenv";
 
+// routes & sockets
 import depositRoutes from "./routes/deposit.js";
-import { initGameSocket } from "./sockets/gameSocket.js";
+import gameSocket from "./sockets/gameSocket.js";
 
+// load env
 dotenv.config();
 
 const app = express();
-const server = http.createServer(app);
+const PORT = process.env.PORT || 4000;
+const MONGO_URI = process.env.MONGO_URI;
 
-/* ------------------ MIDDLEWARE ------------------ */
-
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST"]
-}));
-
+// middleware
+app.use(cors());
 app.use(express.json());
 
-/* ------------------ DATABASE ------------------ */
-
-connectDB();
-
-/* ------------------ ROUTES ------------------ */
-
-// Health check (VERY IMPORTANT FOR RENDER)
+// health check
 app.get("/", (req, res) => {
-  res.json({ status: "Bingo backend running 🚀" });
+  res.send("🚀 Bingo Backend Running Successfully");
 });
 
-// Deposit route (Telebirr / CBE SMS)
+// routes
 app.use("/api/deposit", depositRoutes);
 
-/* ------------------ SOCKET.IO ------------------ */
+// create http server
+const server = http.createServer(app);
 
+// socket.io
 const io = new Server(server, {
   cors: {
     origin: "*",
@@ -45,13 +39,19 @@ const io = new Server(server, {
   }
 });
 
-// Initialize game socket engine
-initGameSocket(io);
+// init sockets
+gameSocket(io);
 
-/* ------------------ SERVER START ------------------ */
+// connect mongodb
+mongoose.connect(MONGO_URI)
+  .then(() => {
+    console.log("✅ MongoDB connected successfully");
+  })
+  .catch((err) => {
+    console.error("❌ MongoDB connection error:", err);
+  });
 
-const PORT = process.env.PORT || 4000;
-
+// start server
 server.listen(PORT, () => {
   console.log(`🚀 Bingo backend running on port ${PORT}`);
 });
