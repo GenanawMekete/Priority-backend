@@ -1,87 +1,150 @@
 import { Server } from "socket.io";
-import { startDrawEngine } from "../engine/drawEngine.js";
-import { checkWinner } from "../engine/patternChecker.js";
 import Card from "../models/Card.js";
+import Game from "../models/Game.js";
+import { checkWinner } from "../engine/patternChecker.js";
+import { startDrawEngine } from "../engine/drawEngine.js";
 
-// In-memory tracking
-let takenCards = new Set();
-let playersInLobby = {};
-let gameStarted = false;
+let currentGame = null;
 
-export default function initializeGameSocket(server) {
+export default function initGameSocket(server) {
   const io = new Server(server, {
     cors: { origin: "*" },
   });
 
-  // Example: load predefined cards (replace with DB)
-  const predefinedCards = Array.from({ length: 400 }, (_, i) => {
-    // 5x5 array
-    const arr = Array.from({ length: 25 }, () => Math.floor(Math.random() * 75) + 1);
-    arr[12] = "FREE"; // center free
-    return arr;
-  });
-
-  function getCardByNumber(cardNumber) {
-    return predefinedCards[cardNumber - 1];
-  }
-
   io.on("connection", (socket) => {
-    console.log("Player connected:", socket.id);
+    console.log("New client connected:", socket.id);
 
-    socket.on("join-lobby", ({ telegramId }) => {
-      if (gameStarted) {
-        socket.emit("lobby-closed");
+    // Player joins the game
+    socket.on("join-game", async ({ telegramId }) => {
+      if (!currentGame) {
+        currentGame = new Game({
+          status: "WAITING",
+          players: [],
+          calledNumbers: [],
+        });
+        await currentGame.save();
+      }
+
+      if (currentGame.status !== "WAITING") {
+        socket.emit("game-started");
         return;
       }
-      if (!playersInLobby[telegramId]) {
-        playersInLobby[telegramId] = {
+
+      // Add player if not already
+      if (!currentGame.players.find((p) => p.telegramId === telegramId)) {
+        currentGame.players.push({
           telegramId,
-          selectedCards: [],
-        };
+          cards: [],
+          hasBingo: false,
+        });
       }
-      socket.emit("lobby-status", {
-        takenCards: Array.from(takenCards),
-        playerCards: playersInLobby[telegramId].selectedCards,
-      });
+
+      await currentGame.save();
+      socket.emit("joined-game", { message: "Joined lobby" });
+      io.emit("player-count", { count: currentGame.players.length });
     });
 
-    socket.on("select-card", ({ telegramId, cardNumber }) => {
-      if (gameStarted) return;
+    // Player selects a card from lobby (1-400)
+    socket.on("select-card", async ({ telegramId, number }) => {
+      if (!currentGame) return;
+      const player = currentGame.players.find((p) => p.telegramId === telegramId);
+      if (!player) return;
+      if (player.cards.length >= 3) return;
 
-      const player = playersInLobby[telegramId];
-      if (!player || player.selectedCards.length >= 3) return;
+      // Check if card is already assigned
+      const assignedNumbers = currentGame.players.flatMap((p) =>
+        p.cards.map((c) => c.number)
+      );
+      if (assignedNumbers.includes(number)) return;
 
-      if (!takenCards.has(cardNumber)) {
-        takenCards.add(cardNumber);
+      // Assign card
+      const card = await Card.findOne({ number }); // predefined card
+      if (!card) return;
 
-        const cardContent = getCardByNumber(cardNumber);
-        player.selectedCards.push({ cardNumber, cardContent });
+      player.cards.push({ number, cardId: card._id });
+      await currentGame.save();
 
-        socket.emit("cards-assigned", { cardNumber, cardContent });
-        io.emit("card-taken", { cardNumber });
+      io.emit("card-assigned", { number, content: card.numbers });
+    });
 
-        // Auto-start if all players have 3 cards
-        const allReady = Object.values(playersInLobby).every(
-          (p) => p.selectedCards.length === 3
-        );
-        if (allReady) {
-          setTimeout(() => startGame(), 1000);
+    // Manual Bingo pressed
+    socket.on("press-bingo", async ({ telegramId }) => {
+      if (!currentGame || currentGame.status !== "RUNNING") return;
+
+      const player = currentGame.players.find((p) => p.telegramId === telegramId);
+      if (!player || player.hasBingo) return;
+
+      let valid = false;
+
+      for (const c of player.cards) {
+        const cardData = await Card.findById(c.cardId);
+        if (checkWinner(cardData.numbers, currentGame.calledNumbers)) {
+          valid = true;
+          break;
         }
       }
+
+      if (!valid) {
+        socket.emit("false-bingo", { telegramId });
+        return;
+      }
+
+      player.hasBingo = true;
+
+      // First valid bingo → stop draw engine
+      if (!currentGame.winners || currentGame.winners.length === 0) {
+        currentGame.status = "VERIFY";
+        if (currentGame.drawInterval) clearInterval(currentGame.drawInterval);
+      }
+
+      currentGame.winners = currentGame.winners || [];
+      currentGame.winners.push(telegramId);
+      await currentGame.save();
+
+      // 1s delay to catch simultaneous winners
+      setTimeout(async () => {
+        const winners = [];
+        for (const p of currentGame.players) {
+          for (const c of p.cards) {
+            const cardData = await Card.findById(c.cardId);
+            if (checkWinner(cardData.numbers, currentGame.calledNumbers)) {
+              winners.push(p.telegramId);
+              break;
+            }
+          }
+        }
+
+        const totalPool = currentGame.players.length * 10;
+        const derash = totalPool * 0.8;
+        const prizePerWinner = derash / winners.length;
+
+        currentGame.status = "FINISHED";
+        currentGame.winners = winners;
+        await currentGame.save();
+
+        io.emit("game-won", { winners, derash, prizePerWinner });
+
+        // 5s winner announcement then reset game
+        setTimeout(() => {
+          currentGame = null;
+          io.emit("new-round");
+        }, 5000);
+      }, 1000);
     });
 
-    function startGame() {
-      if (gameStarted) return;
-      gameStarted = true;
+    // Start game draw manually after lobby countdown
+    socket.on("start-game", async () => {
+      if (!currentGame || currentGame.status !== "WAITING") return;
 
-      const gamePlayers = Object.values(playersInLobby);
-      io.emit("game-started", { players: gamePlayers });
+      currentGame.status = "RUNNING";
+      await currentGame.save();
 
-      startDrawEngine(io, gamePlayers);
-    }
+      // Start drawing numbers every 3 seconds
+      startDrawEngine(io, currentGame);
+    });
 
     socket.on("disconnect", () => {
-      console.log("Player disconnected:", socket.id);
+      console.log("Client disconnected:", socket.id);
     });
   });
 }
