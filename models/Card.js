@@ -1,7 +1,12 @@
 import mongoose from "mongoose";
 
-const CardSchema = new mongoose.Schema({
-  numbers: [[Number]] // 5x5 matrix
+const cardSchema = new mongoose.Schema({
+  numbers: {
+    type: [[Number]],
+    required: true
+  }
 });
 
-export default mongoose.model("Card", CardSchema);
+const Card = mongoose.model("Card", cardSchema);
+
+export default Card;
