@@ -1,3 +1,4 @@
+import { startTelegramBot } from "./bot/telegramBot.js";
 import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
@@ -54,4 +55,5 @@ mongoose.connect(MONGO_URI)
 // start server
 server.listen(PORT, () => {
   console.log(`🚀 Bingo backend running on port ${PORT}`);
+  startTelegramBot();
 });
