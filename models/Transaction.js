@@ -1,12 +1,20 @@
 import mongoose from "mongoose";
 
-const TxSchema = new mongoose.Schema({
+const transactionSchema = new mongoose.Schema({
   telegramId: String,
-  provider: String,        // telebirr | cbe
-  txId: { type: String, unique: true },
   amount: Number,
-  rawText: String,
-  createdAt: { type: Date, default: Date.now }
+  method: String, // telebirr / cbe
+  txId: String,
+  status: {
+    type: String,
+    default: "PENDING"
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
 });
 
-export default mongoose.model("Transaction", TxSchema);
+const Transaction = mongoose.model("Transaction", transactionSchema);
+
+export default Transaction;
